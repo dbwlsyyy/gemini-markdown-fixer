@@ -5,15 +5,9 @@
     let policy;
     try {
         if (window.trustedTypes && window.trustedTypes.createPolicy) {
-            // 이미 정책이 존재하는지 확인하거나 예외 처리
-            const policyName = 'gemini-fix-policy';
+            const policyName = 'gemini-fix-policy-v2';
             const existingPolicies = Array.from(window.trustedTypes.getPolicyNames());
-            
-            if (existingPolicies.includes(policyName)) {
-                // 이미 존재하면 가져오거나, 여기서는 단순 로직이므로 새로 생성하지 않음
-                // 실제로는 window.trustedTypes.getAttributeType 등을 활용할 수 있으나
-                // 확장 프로그램 환경에서는 고유한 이름을 사용하는 것이 안전함
-            } else {
+            if (!existingPolicies.includes(policyName)) {
                 policy = window.trustedTypes.createPolicy(policyName, {
                     createHTML: (input) => input
                 });
@@ -25,61 +19,82 @@
 
     // 2. 마크다운 수정 로직
     function fixMarkdown(element) {
-        const originalHtml = element.innerHTML;
-        
-        // ** 개수가 짝수인지 확인
-        const asteriskCount = (originalHtml.match(/\*\*/g) || []).length * 2;
-        // 실제로는 ** 하나가 2개이므로 match 결과 * 2가 아니라 match 결과 자체가 **의 개수임
-        const doubleAsteriskMatches = originalHtml.match(/\*\*/g);
-        const count = doubleAsteriskMatches ? doubleAsteriskMatches.length : 0;
-        
-        if (count % 2 !== 0) return; // 짝수가 아니면 건너뜀
+        // 텍스트 노드만 순회하며 수정하여 HTML 태그 파괴 방지
+        const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT, null, false);
+        let node;
+        const nodesToReplace = [];
 
-        // 정규식: 볼드체 뒤에 공백 없이 한글이 오는 경우
-        // (\*\*[^\*]+\*\*)([가-힣]+)
-        // 이미 공백이 있는 경우는 건너뛰도록 정규식에서 처리하거나 replace 로직에서 확인
-        const regex = /(\*\*[^\*]+\*\*)([가-힣]+)/g;
-        
-        const modifiedHtml = originalHtml.replace(regex, (match, p1, p2) => {
-            return `${p1} ${p2}`;
-        });
+        while (node = walker.nextNode()) {
+            const text = node.nodeValue;
+            
+            // 패턴 1: **텍스트**한글 -> **텍스트** 한글 (공백 추가)
+            const spaceRegex = /(\*\*[^\*]+\*\*)([가-힣]+)/g;
+            
+            // 패턴 2: 렌더링되지 않은 **텍스트**를 <b>텍스트</b>로 강제 변환 (사용자 피드백 반영)
+            // 주의: 이미 HTML로 변환된 경우(<strong> 등)는 건드리지 않음
+            const boldRegex = /\*\*([^\*]+)\*\*/g;
 
-        if (originalHtml !== modifiedHtml) {
-            // 무한 루프 방지를 위해 일시적으로 observer 중단은 호출하는 쪽에서 처리
-            if (policy) {
-                element.innerHTML = policy.createHTML(modifiedHtml);
-            } else {
-                element.innerHTML = modifiedHtml;
+            if (spaceRegex.test(text) || boldRegex.test(text)) {
+                nodesToReplace.push(node);
             }
+        }
+
+        if (nodesToReplace.length > 0) {
+            // 무한 루프 방지를 위해 observer 일시 중단
+            if (globalObserver) globalObserver.disconnect();
+
+            nodesToReplace.forEach(node => {
+                let newText = node.nodeValue;
+                
+                // 공백 수정
+                newText = newText.replace(/(\*\*[^\*]+\*\*)([가-힣]+)/g, '$1 $2');
+                
+                // 볼드체 강제 렌더링 (HTML 태그로 변환)
+                // 텍스트 노드를 HTML로 바꾸려면 부모 요소의 innerHTML을 건드려야 함
+                const span = document.createElement('span');
+                const htmlContent = newText.replace(/\*\*([^\*]+)\*\*/g, '<strong>$1</strong>');
+                
+                if (policy) {
+                    span.innerHTML = policy.createHTML(htmlContent);
+                } else {
+                    span.innerHTML = htmlContent;
+                }
+
+                if (node.parentNode) {
+                    node.parentNode.replaceChild(span, node);
+                }
+            });
+
+            startObserving();
         }
     }
 
     // 3. MutationObserver 설정
-    const observer = new MutationObserver((mutations) => {
-        for (const mutation of mutations) {
-            if (mutation.type === 'childList') {
-                const targets = document.querySelectorAll('.markdown.markdown-main-panel.stronger');
-                if (targets.length > 0) {
-                    // 무한 루프 방지: 수정 전 disconnect
-                    observer.disconnect();
-                    
-                    targets.forEach(target => fixMarkdown(target));
-                    
-                    // 수정 후 다시 observe
-                    startObserving();
-                }
-            }
-        }
-    });
+    let globalObserver;
+    const observerCallback = (mutations) => {
+        // 성능을 위해 디바운싱 적용 가능하지만, 여기서는 즉시 처리
+        const targets = document.querySelectorAll('.markdown, .markdown-main-panel, [data-message-author-role="assistant"]');
+        targets.forEach(target => fixMarkdown(target));
+    };
+
+    globalObserver = new MutationObserver(observerCallback);
 
     function startObserving() {
-        observer.observe(document.body, {
+        globalObserver.observe(document.body, {
             childList: true,
-            subtree: true
+            subtree: true,
+            characterData: true // 텍스트 변경 감지 (스트리밍 대응)
         });
     }
 
-    // 초기 실행
+    // 초기 실행 및 반복 실행 (스트리밍 대응)
     startObserving();
+    
+    // 제미나이의 동적 로딩 대응을 위해 주기적으로 체크 (보조 장치)
+    setInterval(() => {
+        const targets = document.querySelectorAll('.markdown, .markdown-main-panel, [data-message-author-role="assistant"]');
+        if (targets.length > 0) {
+            observerCallback([]);
+        }
+    }, 2000);
 })();
-// Update: Added logic for better matching
